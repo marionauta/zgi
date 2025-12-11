@@ -12,68 +12,64 @@ pub fn main() !void {
 
     _ = args.skip(); // skip program name
     const directory_name = args.next() orelse {
-        std.log.err("ERROR: missing directory name\n", .{});
+        std.log.err("Missing directory name", .{});
         std.process.exit(1);
     };
 
     const cwd = std.fs.cwd();
     var directory = cwd.openDir(directory_name, .{}) catch |err| {
-        std.log.err("ERROR: unable to open directory {s}: {}", .{ directory_name, err });
+        std.log.err("Unable to open directory {s}: {}", .{ directory_name, err });
         std.process.exit(1);
     };
     defer directory.close();
 
-    const port = 8000;
-    var gateway = Gateway.init(allocator, directory);
-    var server = try httpz.Server(*Gateway).init(allocator, .{ .port = port }, &gateway);
+    var environment = try std.process.getEnvMap(allocator);
+    defer environment.deinit();
+    const hostname = environment.get("HOSTNAME") orelse environment.get("HOST");
+    const port: u16 = if (environment.get("PORT")) |ps| try std.fmt.parseInt(u16, ps, 10) else 8000;
+
+    var context = Context{ .directory = directory };
+    var server = try httpz.Server(*Context).init(allocator, .{ .address = hostname, .port = port }, &context);
     defer server.deinit();
     defer server.stop();
 
     var router = try server.router(.{});
-    router.get("*", serve, .{});
-    std.debug.print("Listening on http://localhost:{}\n", .{port});
+    router.all("*", serve, .{});
+
+    std.debug.print("Listening on http://{s}:{}\n", .{ hostname orelse "localhost", port });
     try server.listen();
 }
 
-const Gateway = struct {
-    allocator: std.mem.Allocator,
+const Context = struct {
     directory: std.fs.Dir,
-
-    fn init(allocator: std.mem.Allocator, directory: fs.Dir) Gateway {
-        return .{
-            .allocator = allocator,
-            .directory = directory,
-        };
-    }
 };
 
-fn serve(gateway: *Gateway, req: *httpz.Request, res: *httpz.Response) !void {
-    const binary_name = req.url.path[1..];
-    if (binary_name.len == 0) {
-        res.status = 404;
-        res.body = "not found";
-        return;
+fn serve(context: *Context, request: *httpz.Request, response: *httpz.Response) !void {
+    const allocator = request.arena;
+
+    const file_name = request.url.path[1..];
+    if (file_name.len == 0) {
+        return not_found(response);
     }
 
-    const binary_stat = gateway.directory.statFile(binary_name) catch {
-        std.log.err("No file {s} in directory", .{binary_name});
-        res.status = 404;
-        res.body = "not found";
-        return;
+    const file = context.directory.openFile(file_name, .{}) catch {
+        std.log.err("No file {s} in directory", .{file_name});
+        return not_found(response);
     };
-    const permissions = std.fs.File.PermissionsUnix.unixNew(binary_stat.mode);
+
+    const permissions = std.fs.File.PermissionsUnix.unixNew(try file.mode());
     if (!permissions.unixHas(.user, .execute)) {
-        std.log.err("Binary {s} is not executable", .{binary_name});
-        res.body = "methd not allowed";
-        return;
+        std.log.err("File {s} is not executable", .{file_name});
+        return not_found(response);
     }
 
     var out_buffer: [1024]u8 = undefined;
     var err_buffer: [1024]u8 = undefined;
-    const res_writer = res.writer();
+    const res_writer = response.writer();
 
-    const binary_path = try gateway.directory.realpathAlloc(gateway.allocator, binary_name);
-    var proc = std.process.Child.init(&.{binary_path}, gateway.allocator);
+    const file_path = try context.directory.realpathAlloc(allocator, file_name);
+    var proc = std.process.Child.init(&.{file_path}, allocator);
+    proc.env_map = &std.process.EnvMap.init(allocator);
     proc.stdout_behavior = .Pipe;
     proc.stderr_behavior = .Pipe;
 
@@ -84,8 +80,21 @@ fn serve(gateway: *Gateway, req: *httpz.Request, res: *httpz.Response) !void {
 
         while (try reader.peekByte() != '\n') {
             if (try reader.takeDelimiter('\n')) |header| {
-                if (split(header)) |parts| {
-                    res.headers.add(parts[0], parts[1]);
+                if (split(header, ':')) |parts| {
+                    if (std.mem.eql(u8, parts[0], "Status")) {
+                        // TODO: clean up this mess
+                        var status = parts[1];
+                        status: for (status, 0..) |value, index| {
+                            if (value != ' ') {
+                                status = status[index..];
+                                break :status;
+                            }
+                        }
+                        if (split(status, ' ')) |status_parts| status = status_parts[0];
+                        response.status = std.fmt.parseInt(u16, status, 10) catch 200;
+                    } else {
+                        response.header(parts[0], parts[1]);
+                    }
                 }
             }
         }
@@ -96,7 +105,7 @@ fn serve(gateway: *Gateway, req: *httpz.Request, res: *httpz.Response) !void {
         var file_reader = err.reader(&err_buffer);
         const reader = &file_reader.interface;
         while (try reader.takeDelimiter('\n')) |line| {
-            std.log.info("{s}: {s}", .{ binary_name, line });
+            std.log.info("{s}: {s}", .{ file_name, line });
         }
     }
     const term = try proc.wait();
@@ -104,11 +113,16 @@ fn serve(gateway: *Gateway, req: *httpz.Request, res: *httpz.Response) !void {
     try res_writer.flush();
 }
 
-fn split(raw: []u8) ?(struct { []u8, []u8 }) {
+fn split(raw: []u8, comptime separator: u8) ?(struct { []u8, []u8 }) {
     for (raw, 1..) |char, index| {
-        if (char == ':') {
+        if (char == separator) {
             return .{ raw[0 .. index - 1], raw[index..] };
         }
     }
     return null;
+}
+
+fn not_found(response: *httpz.Response) void {
+    response.status = 404;
+    response.body = "not found";
 }
