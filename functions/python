@@ -1,0 +1,5 @@
+#!/usr/bin/env python3
+
+print("content-type: text/plain")
+print()
+print("hello from python")
