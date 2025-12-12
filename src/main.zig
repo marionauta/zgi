@@ -36,7 +36,9 @@ pub fn main() !void {
     var router = try server.router(.{});
     router.all("*", serve, .{});
 
+    std.debug.print("Serving scripts in '{s}'\n", .{directory_name});
     std.debug.print("Listening on http://{s}:{}\n", .{ context.hostname, context.port });
+
     try server.listen();
 }
 
@@ -49,22 +51,36 @@ const Context = struct {
 fn serve(context: *Context, request: *httpz.Request, response: *httpz.Response) !void {
     const allocator = request.arena;
 
-    const file_name = request.url.path[1..];
-    if (file_name.len == 0) {
-        return not_found(response);
-    }
-
-    const file = context.directory.openFile(file_name, .{}) catch {
-        std.log.err("No file {s} in directory", .{file_name});
+    var segments = std.mem.splitScalar(u8, request.url.path, '/');
+    const script_name: []const u8 = script_name_builder: {
+        var builder: std.ArrayList(u8) = .empty;
+        while (segments.next()) |segment| {
+            if (segment.len == 0) continue;
+            if (builder.items.len > 0) try builder.append(allocator, '/');
+            try builder.appendSlice(allocator, segment);
+            const file = context.directory.openFile(builder.items, .{}) catch break :script_name_builder error.CantOpen;
+            defer file.close();
+            const stat = try file.stat();
+            if (stat.kind == .directory) continue;
+            const permissions = std.fs.File.PermissionsUnix.unixNew(stat.mode);
+            break :script_name_builder if (permissions.unixHas(.user, .execute)) builder.items else error.NotExecutable;
+        }
+        break :script_name_builder error.NotFound;
+    } catch |err| {
+        std.log.err("No script found for {s}: {}", .{ request.url.path, err });
         return not_found(response);
     };
-    defer file.close();
 
-    const permissions = std.fs.File.PermissionsUnix.unixNew(try file.mode());
-    if (!permissions.unixHas(.user, .execute)) {
-        std.log.err("File {s} is not executable", .{file_name});
-        return not_found(response);
-    }
+    const path_info = blk: {
+        var builder: std.ArrayList(u8) = .empty;
+        while (segments.next()) |segment| {
+            try builder.append(allocator, '/');
+            try builder.appendSlice(allocator, segment);
+        }
+        break :blk builder.items;
+    };
+
+    const query_string = request.url.query;
 
     var body_buffer: std.ArrayList(u8) = .empty;
     if (request.body()) |body| {
@@ -79,7 +95,11 @@ fn serve(context: *Context, request: *httpz.Request, response: *httpz.Response) 
         }
     }
     try environment.put("GATEWAY_INTERFACE", "CGI/1.1");
-    try environment.put("QUERY_STRING", ""); // TODO: pass query string
+    if (path_info.len > 0) {
+        try environment.put("PATH_INFO", path_info);
+        try environment.put("PATH_TRANSLATED", path_info);
+    }
+    try environment.put("QUERY_STRING", query_string);
 
     {
         var address_buffer: std.ArrayList(u8) = .empty;
@@ -94,6 +114,7 @@ fn serve(context: *Context, request: *httpz.Request, response: *httpz.Response) 
         break :blk method[1..];
     } else request.method_string;
     try environment.put("REQUEST_METHOD", method);
+    try environment.put("SCRIPT_NAME", script_name);
     {
         var host = request.header("x-forwarded-host") orelse request.header("host") orelse context.hostname;
         var port: ?[]const u8 = null;
@@ -118,7 +139,7 @@ fn serve(context: *Context, request: *httpz.Request, response: *httpz.Response) 
     var err_buffer: [1024]u8 = undefined;
     const res_writer = response.writer();
 
-    const file_path = try context.directory.realpathAlloc(allocator, file_name);
+    const file_path = try context.directory.realpathAlloc(allocator, script_name);
     var proc = std.process.Child.init(&.{file_path}, allocator);
     proc.env_map = &environment;
     proc.stdin_behavior = .Pipe;
@@ -135,7 +156,7 @@ fn serve(context: *Context, request: *httpz.Request, response: *httpz.Response) 
         var file_reader = err.reader(&err_buffer);
         const reader = &file_reader.interface;
         while (try reader.takeDelimiter('\n')) |line| {
-            std.log.info("{s}: {s}", .{ file_name, line });
+            std.log.info("{s}: {s}", .{ script_name, line });
         }
     }
 
@@ -172,11 +193,11 @@ fn serve(context: *Context, request: *httpz.Request, response: *httpz.Response) 
     switch (try proc.wait()) {
         .Exited => |status| {
             if (status != 0) {
-                std.log.err("{s}: exited with status {}", .{ file_name, status });
+                std.log.err("{s}: exited with status {}", .{ script_name, status });
             }
         },
         else => |term| {
-            std.log.err("{s}: abnormal termination {}", .{ file_name, term });
+            std.log.err("{s}: abnormal termination {}", .{ script_name, term });
         },
     }
 
